@@ -1,0 +1,28 @@
+model:
+  name: "openai/gpt-oss-20b"
+  type: "moe"
+
+training:
+  batch_size: 1
+  grad_accum: 64
+  max_prompt_len: 2048
+  max_gen_len: 1024
+  group_size: 8
+  lr: 5e-7
+  kl_coef: 0.01
+  epochs: 3
+
+tree:
+  max_nodes: 128
+  exploration_const: 1.414
+  max_depth: 6
+
+reward:
+  weights: [0.3, 0.5, 0.2]
+  beta: 1.0
+  corpus_path: "data/validated_corpus.jsonl"
+
+rollout:
+  backend: "sglang"
+  temperature: 0.7
+  top_p: 0.9
