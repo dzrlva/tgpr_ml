@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import logging
 from pathlib import Path
 
 from openai import OpenAI
@@ -68,8 +69,11 @@ def evaluate(row, answer):
 
     try:
         namespace = {"__name__": "__ds1000_eval__"}
-        exec(compile(context, "<ds1000_context>", "exec"),
-             namespace, namespace)
+        exec(
+            compile(context, "<ds1000_context>", "exec"),
+            namespace,
+            namespace,
+        )
 
         test_execution = namespace.get("test_execution")
         test_string = namespace.get("test_string")
@@ -95,6 +99,28 @@ def evaluate(row, answer):
             "passed": False,
             "eval_error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def setup_logger(log_path):
+    logger = logging.getLogger("ds1000")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(
+        log_path,
+        mode="w",
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
 
 
 def main():
@@ -140,22 +166,42 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    log_path = output_path.with_suffix(".log")
+    logger = setup_logger(log_path)
+
     stats = {
         "attempted": 0,
         "api_success": 0,
         "api_errors": 0,
         "evaluated": 0,
         "passed": 0,
+        "failed": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
         "examples_with_usage": 0,
+        "generation_seconds": 0.0,
     }
+
+    logger.info("DS-1000 evaluation started")
+    logger.info("Model: %s", MODEL)
+    logger.info("Dataset: %s", data_path)
+    logger.info("Number of examples: %d", len(rows))
+    logger.info("Temperature: %s", TEMPERATURE)
+    logger.info("Max output tokens: %d", args.max_tokens)
+    logger.info("-" * 80)
 
     with output_path.open("w", encoding="utf-8") as output:
         for index, row in enumerate(tqdm(rows, desc="DS-1000")):
             stats["attempted"] += 1
             record = {"index": index, "model": MODEL}
+
+            started = time.perf_counter()
+            usage = {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+            }
 
             try:
                 prompt = row.get("prompt")
@@ -188,7 +234,16 @@ def main():
                     except Exception as exc:
                         last_error = exc
                         if attempt < args.retries:
-                            time.sleep(min(2 ** attempt, 10))
+                            wait = min(2 ** attempt, 10)
+                            logger.warning(
+                                "Task %d: API attempt %d failed: %s; "
+                                "retrying in %ds",
+                                index + 1,
+                                attempt + 1,
+                                exc,
+                                wait,
+                            )
+                            time.sleep(wait)
 
                 if response is None:
                     raise RuntimeError(str(last_error))
@@ -215,7 +270,7 @@ def main():
                         if usage[key] is not None:
                             stats[key] += usage[key]
 
-                # WARNING: executes benchmark context and generated code.
+                # WARNING: Executes benchmark context and its tests.
                 evaluation = evaluate(row, answer)
                 record.update(evaluation)
                 record["status"] = "evaluated"
@@ -223,13 +278,64 @@ def main():
 
                 if evaluation.get("passed"):
                     stats["passed"] += 1
+                    status = "PASS"
+                    log_level = logging.INFO
+                else:
+                    stats["failed"] += 1
+                    status = "FAIL"
+                    log_level = logging.WARNING
+
+                record["elapsed_seconds"] = round(
+                    time.perf_counter() - started, 4
+                )
+
+                logger.log(
+                    log_level,
+                    (
+                        "Task %d/%d | %s | prompt_tokens=%s | "
+                        "completion_tokens=%s | total_tokens=%s | "
+                        "elapsed=%.2fs | library=%s"
+                    ),
+                    index + 1,
+                    len(rows),
+                    status,
+                    usage["prompt_tokens"],
+                    usage["completion_tokens"],
+                    usage["total_tokens"],
+                    record["elapsed_seconds"],
+                    row.get("metadata", {}).get("library", "Unknown")
+                    if isinstance(row.get("metadata"), dict)
+                    else "Unknown",
+                )
+
+                if evaluation.get("eval_error"):
+                    logger.warning(
+                        "Task %d evaluator error: %s",
+                        index + 1,
+                        evaluation["eval_error"],
+                    )
 
             except Exception as exc:
+                elapsed = time.perf_counter() - started
                 record.update({
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_seconds": round(elapsed, 4),
+                    **usage,
                 })
                 stats["api_errors"] += 1
+
+                logger.error(
+                    "Task %d/%d | ERROR | elapsed=%.2fs | %s: %s",
+                    index + 1,
+                    len(rows),
+                    elapsed,
+                    type(exc).__name__,
+                    exc,
+                )
+
+            elapsed = record.get("elapsed_seconds", 0.0)
+            stats["generation_seconds"] += elapsed
 
             output.write(
                 json.dumps(record, ensure_ascii=False) + "\n"
@@ -249,7 +355,8 @@ def main():
         "model": MODEL,
         "temperature": TEMPERATURE,
         "token_note": (
-            "Counts API-reported usage only; missing usage is not estimated."
+            "Token counts are API-reported usage only; "
+            "missing usage is not estimated."
         ),
         "evaluation_note": (
             "Pass rate is passed/evaluated. Confirm the dataset's "
@@ -264,6 +371,22 @@ def main():
         encoding="utf-8",
     )
 
+    logger.info("-" * 80)
+    logger.info("DS-1000 evaluation finished")
+    logger.info("Attempted: %d", stats["attempted"])
+    logger.info("API success: %d", stats["api_success"])
+    logger.info("API errors: %d", stats["api_errors"])
+    logger.info("Evaluated: %d", stats["evaluated"])
+    logger.info("Passed: %d", stats["passed"])
+    logger.info("Failed: %d", stats["failed"])
+    logger.info("Pass rate: %s%%", summary["pass_rate_percent"])
+    logger.info("Prompt tokens: %d", stats["prompt_tokens"])
+    logger.info("Completion tokens: %d", stats["completion_tokens"])
+    logger.info("Total tokens: %d", stats["total_tokens"])
+    logger.info("Elapsed seconds: %.2f", stats["generation_seconds"])
+    logger.info("Results: %s", output_path)
+    logger.info("Summary: %s", summary_path)
+
     print("\n=== DS-1000 summary ===")
     for key in (
         "attempted",
@@ -271,6 +394,7 @@ def main():
         "api_errors",
         "evaluated",
         "passed",
+        "failed",
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
@@ -278,7 +402,9 @@ def main():
         print(f"{key}: {stats[key]}")
 
     print("Pass rate:", summary["pass_rate_percent"], "%")
+    print("Elapsed seconds:", round(stats["generation_seconds"], 2))
     print("Per-example results:", output_path)
+    print("Text log:", log_path)
     print("Summary:", summary_path)
 
 
