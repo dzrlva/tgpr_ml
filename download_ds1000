@@ -1,0 +1,43 @@
+
+import json
+import urllib.request
+from pathlib import Path
+
+URL = (
+    "https://huggingface.co/datasets/xlangai/DS-1000"
+    "/resolve/main/test.jsonl"
+)
+OUTPUT = Path("data/ds1000.jsonl")
+
+
+def main():
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+
+    request = urllib.request.Request(
+        URL,
+        headers={"User-Agent": "ds1000-downloader/1.0"},
+    )
+
+    print(f"Downloading from {URL}")
+
+    with urllib.request.urlopen(request, timeout=120) as response:
+        OUTPUT.write_bytes(response.read())
+
+    count = 0
+    with OUTPUT.open(encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if line.strip():
+                json.loads(line)
+                count += 1
+
+    print(f"Saved {count} examples to {OUTPUT.resolve()}")
+
+    if count != 1000:
+        print(
+            "WARNING: expected 1000 examples. "
+            "Verify the dataset revision and split."
+        )
+
+
+if __name__ == "__main__":
+    main()
