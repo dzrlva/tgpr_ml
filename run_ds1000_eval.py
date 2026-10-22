@@ -15,7 +15,6 @@ BASE_URL = "https://llm-proxy.t-tech.team/v1"
 MODEL = "openai/gpt-5"
 TEMPERATURE = 0.3
 
-# Должно совпадать с локальным evaluation.
 INSTRUCTION = (
     "Solve this Python data-science task. "
     "Return the solution as Python code.\n\n"
@@ -24,15 +23,8 @@ CONTEXT_MAX_CHARS = 12000
 
 
 def build_prompt(row):
-    """
-    Формат входа такой же, как при подготовке обучающих примеров:
-      instruction
-      Notebook context: <code_context>
-      Task: <prompt>
-
-    Не добавляем контекст повторно, если он уже встроен в prompt.
-    """
     prompt = row.get("prompt")
+
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("Missing prompt field")
 
@@ -54,12 +46,12 @@ def build_prompt(row):
 def clean_answer(text):
     text = (text or "").strip()
 
-    # Извлекаем код из Markdown-блока, если он есть.
     match = re.search(
         r"```(?:python|py)?[ \t]*\n?(.*?)```",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
     if match:
         text = match.group(1).strip()
 
@@ -68,57 +60,55 @@ def clean_answer(text):
 
 def get_usage(response):
     usage = getattr(response, "usage", None)
-    if not usage:
-        return {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-        }
 
-    prompt = getattr(
-        usage,
-        "prompt_tokens",
-        getattr(usage, "input_tokens", None),
-    )
-    completion = getattr(
-        usage,
-        "completion_tokens",
-        getattr(usage, "output_tokens", None),
-    )
-    total = getattr(usage, "total_tokens", None)
-
-    if total is None and prompt is not None and completion is not None:
-        total = prompt + completion
-
-    return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
+    result = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
     }
+
+    if usage is None:
+        return result
+
+    result["prompt_tokens"] = getattr(
+        usage, "prompt_tokens", getattr(usage, "input_tokens", None)
+    )
+    result["completion_tokens"] = getattr(
+        usage, "completion_tokens", getattr(usage, "output_tokens", None)
+    )
+    result["total_tokens"] = getattr(usage, "total_tokens", None)
+
+    if (
+        result["total_tokens"] is None
+        and result["prompt_tokens"] is not None
+        and result["completion_tokens"] is not None
+    ):
+        result["total_tokens"] = (
+            result["prompt_tokens"] + result["completion_tokens"]
+        )
+
+    return result
 
 
 def evaluate(row, answer):
-    """
-    Использует тестовые функции из code_context.
-    ВАЖНО: exec не является песочницей. Выполняйте только доверенный
-    контекст датасета, в изолированной среде.
-    """
+    result = {
+        "passed": False,
+        "execution_passed": None,
+        "string_passed": None,
+        "eval_error": None,
+    }
+
     context = row.get("code_context")
 
     if not isinstance(context, str) or not context.strip():
-        return {
-            "passed": False,
-            "execution_passed": None,
-            "string_passed": None,
-            "eval_error": "Missing code_context",
-        }
+        result["eval_error"] = "Missing code_context"
+        return result
+
+    namespace = {"__name__": "__ds1000_eval__"}
 
     try:
-        namespace = {"__name__": "__ds1000_eval__"}
-
         exec(
             compile(context, "<ds1000_context>", "exec"),
-            namespace,
             namespace,
         )
 
@@ -126,39 +116,32 @@ def evaluate(row, answer):
         test_string = namespace.get("test_string")
 
         if not callable(test_execution):
-            return {
-                "passed": False,
-                "execution_passed": None,
-                "string_passed": None,
-                "eval_error": (
-                    "test_execution(solution) not found in code_context"
-                ),
-            }
+            result["eval_error"] = (
+                "test_execution(solution) not found in code_context"
+            )
+            return result
 
-        execution_passed = bool(test_execution(answer))
+        # Успех — отсутствие исключения, а не обязательно True.
+        test_execution(answer)
+        result["execution_passed"] = True
 
-        # Сохраняем ту же логику, что и в локальном evaluator:
-        # если test_string отсутствует, дополнительная проверка пройдена.
-        string_passed = (
-            bool(test_string(answer))
-            if callable(test_string)
-            else True
-        )
+        if callable(test_string):
+            test_string(answer)
+            result["string_passed"] = True
 
-        return {
-            "passed": execution_passed and string_passed,
-            "execution_passed": execution_passed,
-            "string_passed": string_passed,
-            "eval_error": None,
-        }
+        result["passed"] = True
 
     except Exception as exc:
-        return {
-            "passed": False,
-            "execution_passed": None,
-            "string_passed": None,
-            "eval_error": f"{type(exc).__name__}: {exc}",
-        }
+        result["passed"] = False
+        result["eval_error"] = f"{type(exc).__name__}: {exc}"
+
+        # Если тесты уже выполнялись, отмечаем их провал.
+        if result["execution_passed"] is None:
+            result["execution_passed"] = False
+        elif result["string_passed"] is None:
+            result["string_passed"] = False
+
+    return result
 
 
 def get_library(row):
@@ -183,13 +166,11 @@ def setup_logger(log_path):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(
-        log_path,
-        mode="w",
-        encoding="utf-8",
+    handler = logging.FileHandler(
+        log_path, mode="w", encoding="utf-8"
     )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
     return logger
 
@@ -198,32 +179,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate an API model on DS-1000"
     )
-    parser.add_argument(
-        "--data",
-        default="data/ds1000.jsonl",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Number of examples; 0 means all",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=1024,
-        help="Maximum generated tokens; align with local evaluation",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-    )
-    parser.add_argument(
-        "--pause",
-        type=float,
-        default=0.0,
-    )
+    parser.add_argument("--data", default="data/ds1000.jsonl")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--pause", type=float, default=0.0)
     parser.add_argument(
         "--output",
         default="results/ds1000_gpt5_results.jsonl",
@@ -236,17 +196,10 @@ def main():
 
     data_path = Path(args.data)
     if not data_path.exists():
-        parser.error(
-            f"Dataset not found: {data_path}. "
-            "Run download_ds1000.py first."
-        )
+        parser.error(f"Dataset not found: {data_path}")
 
-    with data_path.open(encoding="utf-8") as file:
-        rows = [
-            json.loads(line)
-            for line in file
-            if line.strip()
-        ]
+    with data_path.open(encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
 
     if args.limit > 0:
         rows = rows[:args.limit]
@@ -279,18 +232,14 @@ def main():
         "generation_seconds": 0.0,
     }
 
-    logger.info("DS-1000 evaluation started")
     logger.info("Model: %s", MODEL)
     logger.info("Dataset: %s", data_path)
-    logger.info("Number of examples: %d", len(rows))
-    logger.info("Temperature: %s", TEMPERATURE)
-    logger.info("Max output tokens: %d", args.max_tokens)
-    logger.info("Prompt format: instruction + optional context + task")
-    logger.info("-" * 80)
+    logger.info("Examples: %d", len(rows))
 
     with output_path.open("w", encoding="utf-8") as output:
         for index, row in enumerate(tqdm(rows, desc="DS-1000")):
             stats["attempted"] += 1
+            started = time.perf_counter()
 
             record = {
                 "index": index,
@@ -298,7 +247,9 @@ def main():
                 "library": get_library(row),
             }
 
-            started = time.perf_counter()
+            model_prompt = ""
+            raw_answer = ""
+            answer = ""
             usage = {
                 "prompt_tokens": None,
                 "completion_tokens": None,
@@ -307,7 +258,6 @@ def main():
 
             try:
                 model_prompt = build_prompt(row)
-
                 response = None
                 last_error = None
 
@@ -335,25 +285,14 @@ def main():
 
                     except Exception as exc:
                         last_error = exc
-
                         if attempt < args.retries:
-                            wait = min(2 ** attempt, 10)
-                            logger.warning(
-                                "Task %d: API attempt %d failed: %s; "
-                                "retrying in %ds",
-                                index + 1,
-                                attempt + 1,
-                                exc,
-                                wait,
-                            )
-                            time.sleep(wait)
+                            time.sleep(min(2 ** attempt, 10))
 
                 if response is None:
                     raise RuntimeError(str(last_error))
 
-                answer = clean_answer(
-                    response.choices[0].message.content
-                )
+                raw_answer = response.choices[0].message.content or ""
+                answer = clean_answer(raw_answer)
                 usage = get_usage(response)
 
                 stats["api_success"] += 1
@@ -361,89 +300,58 @@ def main():
                 if usage["total_tokens"] is not None:
                     stats["examples_with_usage"] += 1
 
-                    for key in (
-                        "prompt_tokens",
-                        "completion_tokens",
-                        "total_tokens",
-                    ):
-                        if usage[key] is not None:
-                            stats[key] += usage[key]
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                ):
+                    if usage[key] is not None:
+                        stats[key] += usage[key]
 
                 evaluation = evaluate(row, answer)
                 stats["evaluated"] += 1
 
-                if evaluation.get("passed"):
+                if evaluation["passed"]:
                     stats["passed"] += 1
-                    status = "PASS"
-                    log_level = logging.INFO
                 else:
                     stats["failed"] += 1
-                    status = "FAIL"
-                    log_level = logging.WARNING
-
-                elapsed = time.perf_counter() - started
 
                 record.update({
                     "status": "evaluated",
-                    "answer": answer,
-                    # Сохраняем точный вход для проверки идентичности формата.
+                    "prompt": row.get("prompt"),
                     "input_prompt": model_prompt,
+                    "raw_answer": raw_answer,
+                    "answer": answer,
                     **usage,
                     **evaluation,
-                    "elapsed_seconds": round(elapsed, 4),
                 })
 
-                logger.log(
-                    log_level,
-                    (
-                        "Task %d/%d | %s | prompt_tokens=%s | "
-                        "completion_tokens=%s | total_tokens=%s | "
-                        "elapsed=%.2fs | library=%s"
-                    ),
-                    index + 1,
-                    len(rows),
-                    status,
-                    usage["prompt_tokens"],
-                    usage["completion_tokens"],
-                    usage["total_tokens"],
-                    elapsed,
-                    record["library"],
-                )
-
-                if evaluation.get("eval_error"):
+                if evaluation["eval_error"]:
                     logger.warning(
-                        "Task %d evaluator error: %s",
-                        index + 1,
+                        "Index %d evaluator error: %s",
+                        index,
                         evaluation["eval_error"],
                     )
 
             except Exception as exc:
-                elapsed = time.perf_counter() - started
-
+                stats["api_errors"] += 1
                 record.update({
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}",
-                    "elapsed_seconds": round(elapsed, 4),
+                    "prompt": row.get("prompt"),
+                    "input_prompt": model_prompt,
+                    "raw_answer": raw_answer,
+                    "answer": answer,
                     **usage,
                 })
-                stats["api_errors"] += 1
 
-                logger.error(
-                    "Task %d/%d | ERROR | elapsed=%.2fs | %s: %s",
-                    index + 1,
-                    len(rows),
-                    elapsed,
-                    type(exc).__name__,
-                    exc,
-                )
+                logger.exception("Index %d failed", index)
 
-            stats["generation_seconds"] += record.get(
-                "elapsed_seconds", 0.0
-            )
+            elapsed = time.perf_counter() - started
+            record["elapsed_seconds"] = round(elapsed, 4)
+            stats["generation_seconds"] += elapsed
 
-            output.write(
-                json.dumps(record, ensure_ascii=False) + "\n"
-            )
+            output.write(json.dumps(record, ensure_ascii=False) + "\n")
             output.flush()
 
             if args.pause:
@@ -454,22 +362,13 @@ def main():
     summary = {
         **stats,
         "pass_rate": stats["passed"] / n if n else None,
-        "pass_rate_percent": (
-            100 * stats["passed"] / n if n else None
-        ),
+        "pass_rate_percent": 100 * stats["passed"] / n if n else None,
         "model": MODEL,
         "temperature": TEMPERATURE,
-        "prompt_format": (
-            "Same textual instruction/context/task structure as local "
-            "evaluation; API chat messages add a system message."
-        ),
-        "token_note": (
-            "Token counts are API-reported usage only. "
-            "Missing usage is not estimated."
-        ),
+        "max_tokens": args.max_tokens,
         "evaluation_note": (
-            "Uses test_execution and optional test_string from code_context. "
-            "Verify this matches the official DS-1000 evaluation protocol."
+            "Success means test_execution and optional test_string "
+            "completed without exceptions."
         ),
     }
 
@@ -478,50 +377,9 @@ def main():
         encoding="utf-8",
     )
 
-    logger.info("-" * 80)
-    logger.info("DS-1000 evaluation finished")
-
-    for key in (
-        "attempted",
-        "api_success",
-        "api_errors",
-        "evaluated",
-        "passed",
-        "failed",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-    ):
-        logger.info("%s: %s", key, stats[key])
-
-    logger.info("Pass rate: %s%%", summary["pass_rate_percent"])
-    logger.info(
-        "Elapsed seconds: %.2f",
-        stats["generation_seconds"],
-    )
-    logger.info("Results: %s", output_path)
-    logger.info("Summary: %s", summary_path)
-
-    print("\n=== DS-1000 API evaluation summary ===")
-    for key in (
-        "attempted",
-        "api_success",
-        "api_errors",
-        "evaluated",
-        "passed",
-        "failed",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-    ):
-        print(f"{key}: {stats[key]}")
-
-    print("Pass rate:", summary["pass_rate_percent"], "%")
-    print(
-        "Elapsed seconds:",
-        round(stats["generation_seconds"], 2),
-    )
-    print("Results:", output_path)
+    print("\n=== API evaluation summary ===")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print("\nResults:", output_path)
     print("Log:", log_path)
     print("Summary:", summary_path)
 
@@ -532,15 +390,17 @@ if __name__ == "__main__":
 
 
 
-export LLM_API_KEY="YOUR_API_KEY"
+
+
+
+
+
 
 python evaluate_gpt5.py \
   --data data/ds1000.jsonl \
   --limit 5 \
   --max-tokens 1024 \
   --output results/ds1000_gpt5_test.jsonl
-
-
 
 
 python evaluate_gpt5.py \
